@@ -1,0 +1,735 @@
+# ==============================================================================
+# START OF BLOCK 1: IMPORTS AND CORE LOGIC ENGINE
+# ==============================================================================
+import os
+import glob
+import subprocess
+import shutil
+import fnmatch  
+import traceback  
+import hou
+from PySide6 import QtWidgets, QtCore, QtGui
+
+try:
+    import PyOpenColorIO as OCIO
+except ImportError:
+    try:
+        import PyToolkitOCIO as OCIO  
+    except ImportError:
+        OCIO = None
+
+class RatManagerCore:
+    """Handles scene scraping, disk checking, and file operations via native OCIO configs."""
+    
+    IMAGE_PARM_NAMES = [
+        "map", "file", "filename", "texture", "tex", "basecolor_texture", 
+        "rough_texture", "metallic_texture", "normal_texture", "bump_texture",
+        "picture", "vm_picture", "output", "renderoutput"
+    ]
+
+    RENDER_OUTPUT_NODE_TYPES = [
+        "ifd", "karma", "usdrender", "usdrenderproperties", "arnold", "vray", 
+        "geometry", "comp", "render", "channel", "baketexture", "labs::maps_baker"
+    ]
+
+    _ocio_config_cache = None
+    _ocio_config_source = ""
+    debug_enabled = False
+
+    @classmethod
+    def _find_user_pref_ocio_file(cls):
+        """Looks for an .ocio config inside Documents/houdini22.0/ocio (or $HOUDINI_USER_PREF_DIR/ocio)."""
+        candidate_dirs = []
+
+        # 1. Houdini's active user pref dir (normally Documents/houdini22.0)
+        try:
+            pref_dir = hou.getenv("HOUDINI_USER_PREF_DIR")
+            if pref_dir:
+                candidate_dirs.append(os.path.join(pref_dir, "ocio"))
+        except Exception:
+            pass
+
+        # 2. Explicit ~/Documents/houdini22.0/ocio fallback
+        candidate_dirs.append(os.path.join(os.path.expanduser("~"), "Documents", "houdini22.0", "ocio"))
+
+        seen_dirs = set()
+        for ocio_dir in candidate_dirs:
+            norm_dir = os.path.normpath(ocio_dir)
+            if norm_dir in seen_dirs or not os.path.isdir(norm_dir):
+                continue
+            seen_dirs.add(norm_dir)
+
+            # Prefer config.ocio if present
+            default_cfg = os.path.join(norm_dir, "config.ocio")
+            if os.path.isfile(default_cfg):
+                return os.path.abspath(default_cfg)
+
+            # Otherwise look for any .ocio file in that folder (pick most recently modified)
+            ocio_files = glob.glob(os.path.join(norm_dir, "*.ocio"))
+            if ocio_files:
+                ocio_files.sort(key=os.path.getmtime, reverse=True)
+                return os.path.abspath(ocio_files[0])
+
+        return None
+
+    @classmethod
+    def get_ocio_config_path(cls):
+        """Resolves the OCIO config path in priority order:
+        1. $OCIO environment variable (if set and valid)
+        2. Documents/houdini22.0/ocio (user preference override folder)
+        3. Houdini's internal hou.Color.ocio_configPath()
+        """
+        if cls.debug_enabled:
+            config = OCIO.GetCurrentConfig()
+            rules = config.getFileRules()
+            print(f"\n ocio rules: {rules} \n")
+        # 1. Check $OCIO environment variable first
+        env_path = ""
+        env_path = os.environ.get("OCIO") or ""
+        if not env_path:
+            try:
+                env_path = hou.getenv("OCIO") or ""
+            except Exception:
+                env_path = ""
+
+        if env_path and os.path.isfile(env_path):
+            cls._ocio_config_source = "$OCIO Environment Variable"
+            return os.path.abspath(env_path)
+
+        # 2. Check Documents\houdini22.0\ocio folder
+        user_ocio = cls._find_user_pref_ocio_file()
+        if user_ocio and os.path.isfile(user_ocio):
+            cls._ocio_config_source = "User Prefs (houdini22.0/ocio)"
+            return user_ocio
+
+        # 3. Fallback to Houdini's internal config path
+        try:
+            cfg_path = hou.Color.ocio_configPath()
+            if cfg_path and os.path.isfile(cfg_path):
+                cls._ocio_config_source = "Houdini Internal Default"
+                return os.path.abspath(cfg_path)
+        except Exception:
+            pass
+
+        cls._ocio_config_source = "OCIO Built-in Fallback"
+        return "Houdini Built-in Default Profile"
+
+    @classmethod
+    def clear_ocio_cache(cls):
+        """Clears the cached OCIO config so edits saved to disk are reloaded."""
+        cls._ocio_config_cache = None
+        cls._ocio_config_source = ""
+
+    @classmethod
+    def get_ocio_config(cls):
+        """Loads and caches the resolved OCIO configuration file."""
+        if cls._ocio_config_cache is None:
+            if OCIO is None:
+                return None
+            try:
+                cfg_path = cls.get_ocio_config_path()
+                if cfg_path and os.path.isfile(cfg_path):
+                    cls._ocio_config_cache = OCIO.Config.CreateFromFile(cfg_path)
+                else:
+                    cls._ocio_config_cache = OCIO.GetCurrentConfig()
+            except Exception as e:
+                if cls.debug_enabled:
+                    print(f"[OCIO Debug] Error creating config instance: {e}")
+                cls._ocio_config_cache = None
+        return cls._ocio_config_cache
+
+    @classmethod
+    def is_render_output_node(cls, node_type_name):
+        """Checks if a node type falls under render settings or file cache outputs."""
+        name_lower = node_type_name.lower()
+        return any(t in name_lower for t in cls.RENDER_OUTPUT_NODE_TYPES)
+
+    @classmethod
+    def get_node_colorspace(cls, node, filename_val):
+        """Queries the active OCIO library configuration rules to evaluate the colorspace with debugging."""
+        if not filename_val:
+            return "None"
+
+        node_p = node.path()
+
+        # 1. Check for explicit parameter override on the node
+        for cs_pname in ["colorspace", "color_space", "ociocolorspace", "texture_colorspace"]:
+            cs_parm = node.parm(cs_pname)
+            if cs_parm:
+                val = cs_parm.eval()
+                if val and val.strip() and val.lower() not in ["auto", "default", "0"]:
+                    if cls.debug_enabled:
+                        print(f"[OCIO Debug] Node Override matched at: {node_p} -> Space: '{val}'")
+                    return str(val)
+
+        # 2. Evaluate path pattern natively matching top-down config rules against ORIGINAL file
+        if OCIO is not None:
+            try:
+                config = cls.get_ocio_config()
+                if config:
+                    resolved_space = config.getColorSpaceFromFilepath(filename_val)
+                    if resolved_space:
+                        if isinstance(resolved_space, (tuple, list)) and len(resolved_space) > 0:
+                            resolved_space = resolved_space[0]
+                        if cls.debug_enabled:
+                            print(f"[OCIO Debug] File Rule matched for original path: '{filename_val}' at node {node_p} -> Space: '{resolved_space}'")
+                        return str(resolved_space)
+            except Exception as e:
+                if cls.debug_enabled:
+                    print(f"[OCIO Debug] Exception during rule matching for node {node_p}: {e}")
+                pass
+        else:
+            if cls.debug_enabled:
+                print("[OCIO Debug] OpenColorIO Python module could not be imported.")
+            
+        if cls.debug_enabled:
+            print(f"[OCIO Debug] Fallback assigned for original path: '{filename_val}' at node {node_p} -> Space: 'Default (OCIO)'")
+        return "Default (OCIO)"
+
+    @classmethod
+    def resolve_orig_and_rat_eval_paths(cls, eval_path):
+        """Given an evaluated parameter path (which may end in .rat), returns (orig_eval_path, rat_eval_path)."""
+        if not eval_path:
+            return "", ""
+        if eval_path.lower().endswith(".rat"):
+            rat_eval_path = eval_path
+            orig_eval_path = eval_path[:-4]
+        else:
+            orig_eval_path = eval_path
+            rat_eval_path = cls.get_rat_path(eval_path)
+        return orig_eval_path, rat_eval_path
+
+    @classmethod
+    def find_texture_nodes(cls):
+        """Scrapes the Houdini scene for nodes containing texture parameters."""
+        texture_data = []
+        for node in hou.node("/").allNodes():
+            if node.isInsideLockedHDA():
+                continue
+            node_type = node.type().name()
+            is_render_node = cls.is_render_output_node(node_type)
+            
+            for parm in node.parms():
+                if parm.name() in cls.IMAGE_PARM_NAMES or isinstance(parm.parmTemplate(), hou.StringParmTemplate):
+                    val = parm.eval()
+                    raw = parm.rawValue()
+                    if val and any(val.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.tga', '.exr', '.tif', '.tiff', '.rat']):
+                        
+                        if raw.lower().endswith('.rat'):
+                            rat_raw = raw
+                            if raw.lower().endswith('.exr.rat'):
+                                orig_raw = raw[:-4]  
+                            else:
+                                base_raw, _ = os.path.splitext(raw[:-4])
+                                orig_raw = base_raw + ".exr"  
+                        else:
+                            orig_raw = raw
+                            rat_raw = f"{raw}.rat"
+
+                        orig_eval_path, rat_eval_path = cls.resolve_orig_and_rat_eval_paths(val)
+
+                        # Always evaluate colorspace from the original source file path
+                        colorspace = cls.get_node_colorspace(node, orig_eval_path)
+
+                        texture_data.append({
+                            "node_path": node.path(),
+                            "node_type": node_type,
+                            "is_render_node": is_render_node,
+                            "parm_name": parm.name(),
+                            "raw_path": raw,
+                            "orig_raw": orig_raw,
+                            "rat_raw": rat_raw,
+                            "eval_path": val,
+                            "orig_eval_path": orig_eval_path,
+                            "rat_eval_path": rat_eval_path,
+                            "colorspace": colorspace
+                        })
+        return texture_data
+
+    @classmethod
+    def get_rat_path(cls, orig_path):
+        """Returns the intended evaluation path for the .rat file on disk (appending instead of replacing)."""
+        return f"{orig_path}.rat"
+
+    @classmethod
+    def verify_status(cls, path):
+        """Checks disk availability and modification times for the original source and its .rat pair."""
+        if not path:
+            return "Missing Source", False, False
+        
+        src_path, rat_path = cls.resolve_orig_and_rat_eval_paths(path)
+        src_exists = bool(src_path) and os.path.exists(src_path)
+        rat_exists = bool(rat_path) and os.path.exists(rat_path)
+
+        if not src_exists and not rat_exists:
+            return "Missing All", False, False
+        if src_exists and not rat_exists:
+            return "No RAT", True, False
+        if not src_exists and rat_exists:
+            return "RAT Only", False, True
+
+        # Both exist: check if the .rat file is older than the original file
+        try:
+            src_mtime = os.path.getmtime(src_path)
+            rat_mtime = os.path.getmtime(rat_path)
+            if rat_mtime < src_mtime:
+                return "Outdated", True, True
+        except OSError:
+            pass
+
+        return "Optimized", True, True
+# ==============================================================================
+# END OF BLOCK 1: IMPORTS AND CORE LOGIC ENGINE
+# ==============================================================================
+
+
+# ==============================================================================
+# START OF BLOCK 2: ASYNCHRONOUS BACKGROUND WORKER
+# ==============================================================================
+class ConvertWorker(QtCore.QThread):
+    """Asynchronously generates RAT files using Houdini's iconvert utility."""
+    progress_signal = QtCore.Signal(str, int)
+    finished_signal = QtCore.Signal()
+
+    def __init__(self, conversion_tasks, parent=None):
+        super().__init__(parent)
+        self.tasks = conversion_tasks # List of (src, dest)
+
+    def run(self):
+        total = len(self.tasks)
+        for idx, (src, dest) in enumerate(self.tasks):
+            if not os.path.exists(src):
+                self.progress_signal.emit(f"Failed: Source missing {os.path.basename(src)}", idx + 1)
+                continue
+            
+            self.progress_signal.emit(f"Converting: {os.path.basename(src)}", idx + 1)
+            
+            iconvert_bin = "iconvert"
+            if os.name == 'nt':
+                iconvert_bin = os.path.join(os.environ.get("HFS", ""), "bin", "iconvert.exe")
+                
+            try:
+                subprocess.run([iconvert_bin, src, dest], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except Exception as e:
+                print(f"Error converting {src}: {e}")
+                
+        self.finished_signal.emit()
+# ==============================================================================
+# END OF BLOCK 2: ASYNCHRONOUS BACKGROUND WORKER
+# ==============================================================================
+
+
+# ==============================================================================
+# START OF BLOCK 3: UI SETUP AND COMPONENT LAYOUT
+# ==============================================================================
+class RatManagerWindow(QtWidgets.QMainWindow):
+    def __init__(self, parent=hou.qt.mainWindow()):
+        super().__init__(parent)
+        self.setWindowTitle("RAT File Manager (Houdini 22)")
+        self.resize(1200, 650)
+        
+        self.all_items_data = []
+        self.setup_ui()
+        self.refresh_data()
+
+    def setup_ui(self):
+        main_widget = QtWidgets.QWidget()
+        self.setCentralWidget(main_widget)
+        layout = QtWidgets.QVBoxLayout(main_widget)
+
+        # --- Filter & Search Toolbar ---
+        filter_bar = QtWidgets.QHBoxLayout()
+        
+        self.search_bar = QtWidgets.QLineEdit()
+        self.search_bar.setPlaceholderText("Search using wildcards (e.g. *diffuse* or /obj/*)...")
+        self.search_bar.textChanged.connect(self.filter_tree)
+        filter_bar.addWidget(self.search_bar)
+
+        self.status_filter = QtWidgets.QComboBox()
+        self.status_filter.addItems(["All Statuses", "Optimized", "Outdated", "No RAT", "Missing All", "RAT Only"])
+        self.status_filter.currentIndexChanged.connect(self.filter_tree)
+        filter_bar.addWidget(self.status_filter)
+
+        self.network_filter = QtWidgets.QComboBox()
+        self.network_filter.addItems(["All Networks", "/obj", "/mat", "/stage", "/img"])
+        self.network_filter.currentIndexChanged.connect(self.filter_tree)
+        filter_bar.addWidget(self.network_filter)
+
+        self.exclude_render_cb = QtWidgets.QCheckBox("Exclude Render/Output Nodes")
+        self.exclude_render_cb.setChecked(True)
+        self.exclude_render_cb.stateChanged.connect(self.filter_tree)
+        filter_bar.addWidget(self.exclude_render_cb)
+
+        self.debug_ocio_cb = QtWidgets.QCheckBox("Enable OCIO Debugging")
+        self.debug_ocio_cb.setChecked(False)
+        self.debug_ocio_cb.stateChanged.connect(self.refresh_data)
+        filter_bar.addWidget(self.debug_ocio_cb)
+
+        layout.addLayout(filter_bar)
+
+        # --- Tree Widget ---
+        self.tree = QtWidgets.QTreeWidget()
+        self.tree.setColumnCount(7)
+        self.tree.setHeaderLabels(["Network / Node / Parameter", "Status", "Source File", "RAT File", "Colorspace", "Node Type", "Raw String"])
+        self.tree.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.tree.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self.show_context_menu)
+        layout.addWidget(self.tree)
+
+        # --- Action Buttons ---
+        btn_layout = QtWidgets.QHBoxLayout()
+        
+        btn_refresh = QtWidgets.QPushButton("Refresh Scene Tree")
+        btn_refresh.clicked.connect(self.refresh_data)
+        btn_layout.addWidget(btn_refresh)
+
+        btn_gen = QtWidgets.QPushButton("Generate Selected RATs")
+        btn_gen.clicked.connect(self.generate_rats)
+        btn_layout.addWidget(btn_gen)
+
+        btn_regen_outdated = QtWidgets.QPushButton("Regenerate All Outdated RATs")
+        btn_regen_outdated.clicked.connect(self.regenerate_outdated_rats)
+        btn_layout.addWidget(btn_regen_outdated)
+
+        btn_del = QtWidgets.QPushButton("Delete Selected RATs")
+        btn_del.clicked.connect(self.delete_rats)
+        btn_layout.addWidget(btn_del)
+
+        layout.addLayout(btn_layout)
+
+        # --- Progress Bar ---
+        self.progress_bar = QtWidgets.QProgressBar()
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+# ==============================================================================
+# END OF BLOCK 3: UI SETUP AND COMPONENT LAYOUT
+# ==============================================================================
+
+
+# ==============================================================================
+# START OF BLOCK 4: TREE POPULATION AND FILTERING LOGICS
+# ==============================================================================
+    def refresh_data(self):
+        """Scrapes Houdini and rebuilds the hierarchical tree layout."""
+        RatManagerCore.debug_enabled = self.debug_ocio_cb.isChecked()
+        RatManagerCore.clear_ocio_cache()
+
+        if RatManagerCore.debug_enabled:
+            active_cfg = RatManagerCore.get_ocio_config_path()
+            print("\n" + "="*70)
+            print("[OCIO Debug] --- BEGINNING COLORSPACE SCENE TRACE ---")
+            print(f"[OCIO Debug] CONFIG SOURCE: {RatManagerCore._ocio_config_source}")
+            print(f"[OCIO Debug] ACTIVE CONFIG PROFILE: '{active_cfg}'")
+            print("="*70)
+
+        self.tree.clear()
+        self.all_items_data = RatManagerCore.find_texture_nodes()
+        root_nodes = {}
+
+        self.tree.setColumnCount(7)
+        self.tree.setHeaderLabels(["Network / Node / Parameter", "Status", "Source File", "RAT File", "Colorspace", "Node Type", "Raw String"])
+
+        for data in self.all_items_data:
+            node_path = data["node_path"]
+            status, src_ok, rat_ok = RatManagerCore.verify_status(data["eval_path"])
+            data["status"] = status
+
+            orig_eval_path = data.get("orig_eval_path") or data["eval_path"]
+            rat_eval_path = data.get("rat_eval_path") or RatManagerCore.get_rat_path(orig_eval_path)
+
+            parts = node_path.strip("/").split("/")
+            parent_item = self.tree.invisibleRootItem()
+            
+            current_path = ""
+            for i, part in enumerate(parts):
+                current_path += f"/{part}"
+                if current_path not in root_nodes:
+                    new_item = QtWidgets.QTreeWidgetItem(parent_item, [part])
+                    new_item.setData(0, QtCore.Qt.UserRole, {"type": "dir", "path": current_path})
+                    if i == len(parts) - 1:
+                        new_item.setText(5, data["node_type"]) 
+                        try:
+                            node_icon = hou.qt.Icon(data["node_type"], 16, 16) if hou.qt.Icon(data["node_type"]) else QtGui.QIcon()
+                            new_item.setIcon(0, node_icon)
+                        except (hou.OperationFailed, Exception):
+                            new_item.setIcon(0, QtGui.QIcon())
+                            
+                    root_nodes[current_path] = new_item
+                parent_item = root_nodes[current_path]
+
+            parm_item = QtWidgets.QTreeWidgetItem(parent_item, [
+                data["parm_name"], 
+                status, 
+                os.path.basename(orig_eval_path), 
+                os.path.basename(rat_eval_path),
+                data["colorspace"],
+                "",
+                data["raw_path"]
+            ])
+            parm_item.setData(0, QtCore.Qt.UserRole, {"type": "parm", "data": data})
+            
+            if status == "Optimized":
+                parm_item.setForeground(1, QtGui.QColor("#4CAF50"))
+            elif status == "Outdated":
+                parm_item.setForeground(1, QtGui.QColor("#FF9800"))
+            elif status == "No RAT":
+                parm_item.setForeground(1, QtGui.QColor("#FFC107"))
+            else:
+                parm_item.setForeground(1, QtGui.QColor("#F44336"))
+
+            if "raw" in data["colorspace"].lower() or "non-color" in data["colorspace"].lower():
+                parm_item.setForeground(4, QtGui.QColor("#80cbc4"))
+            else:
+                parm_item.setForeground(4, QtGui.QColor("#ce93d8"))
+
+        if RatManagerCore.debug_enabled:
+            print("="*70)
+            print("[OCIO Debug] --- COLORSPACE SCENE TRACE FINISHED ---")
+            print("="*70 + "\n")
+
+        self.tree.expandAll()
+        self.filter_tree()
+
+    def filter_tree(self):
+        """Hides/Shows items according to the filter controls, including wildcard patterns."""
+        search_txt = self.search_bar.text().strip().lower()
+        status_txt = self.status_filter.currentText()
+        net_txt = self.network_filter.currentText()
+        exclude_render = self.exclude_render_cb.isChecked()
+
+        if search_txt and '*' not in search_txt:
+            search_pattern = f"*{search_txt}*"
+        else:
+            search_pattern = search_txt
+
+        def evaluate_visibility(item):
+            is_parm = item.data(0, QtCore.Qt.UserRole) and item.data(0, QtCore.Qt.UserRole).get("type") == "parm"
+            
+            if is_parm:
+                p_data = item.data(0, QtCore.Qt.UserRole)["data"]
+                
+                if exclude_render and p_data["is_render_node"]:
+                    item.setHidden(True)
+                    return False
+
+                if search_pattern:
+                    match_search = (
+                        fnmatch.fnmatch(p_data["node_path"].lower(), search_pattern) or
+                        fnmatch.fnmatch(p_data["eval_path"].lower(), search_pattern) or
+                        fnmatch.fnmatch(p_data.get("orig_eval_path", "").lower(), search_pattern) or
+                        fnmatch.fnmatch(p_data["colorspace"].lower(), search_pattern) or 
+                        fnmatch.fnmatch(p_data["parm_name"].lower(), search_pattern)
+                    )
+                else:
+                    match_search = True
+
+                match_status = (status_txt == "All Statuses" or p_data["status"] == status_txt)
+                match_net = (net_txt == "All Networks" or p_data["node_path"].startswith(net_txt))
+
+                visible = match_search and match_status and match_net
+                item.setHidden(not visible)
+                return visible
+            else:
+                any_child_visible = False
+                for idx in range(item.childCount()):
+                    if evaluate_visibility(item.child(idx)):
+                        any_child_visible = True
+                item.setHidden(not any_child_visible)
+                return any_child_visible
+
+        for idx in range(self.tree.topLevelItemCount()):
+            evaluate_visibility(self.tree.topLevelItem(idx))
+
+    def get_selected_parm_data(self):
+        collected = []
+        def gather(item):
+            role_data = item.data(0, QtCore.Qt.UserRole)
+            if role_data and role_data.get("type") == "parm":
+                collected.append(role_data["data"])
+            for i in range(item.childCount()):
+                gather(item.child(i))
+
+        for item in self.tree.selectedItems():
+            gather(item)
+        return collected
+# ==============================================================================
+# END OF BLOCK 4: TREE POPULATION AND FILTERING LOGICS
+# ==============================================================================
+
+
+# ==============================================================================
+# START OF BLOCK 5: ACTIONS, CONTEXT MENUS, AND PANEL INTERFACE INTEGRATION
+# ==============================================================================
+    def show_context_menu(self, position):
+        menu = QtWidgets.QMenu()
+        act_select_node = menu.addAction("Select Matching Nodes in Houdini")
+        menu.addSeparator()
+        act_switch_rat = menu.addAction("Toggle Parameter to use .rat Path")
+        act_switch_orig = menu.addAction("Toggle Parameter to use Original Path")
+        menu.addSeparator()
+        act_gen_rat = menu.addAction("Generate Selected RATs")
+        act_regen_outdated = menu.addAction("Regenerate All Outdated RATs")
+        act_del_rat = menu.addAction("Delete Selected RATs")
+        
+        action = menu.exec_(self.tree.viewport().mapToGlobal(position))
+        if not action:
+            return
+
+        if action == act_regen_outdated:
+            self.regenerate_outdated_rats()
+            return
+
+        selected_data = self.get_selected_parm_data()
+        if not selected_data:
+            return
+
+        if action == act_select_node:
+            hou.clearAllSelected()
+            for d in selected_data:
+                hou.node(d["node_path"]).setSelected(True, clear_all_selected=False)
+                
+        elif action in [act_switch_rat, act_switch_orig]:
+            for d in selected_data:
+                parm = hou.parm(f"{d['node_path']}/{d['parm_name']}")
+                if parm:
+                    if action == act_switch_rat:
+                        parm.set(d["rat_raw"])
+                    else:
+                        parm.set(d["orig_raw"])
+            self.refresh_data()
+            
+        elif action == act_gen_rat:
+            self.generate_rats()
+            
+        elif action == act_del_rat:
+            self.delete_rats()
+
+    def _run_conversion_tasks(self, tasks):
+        """Starts the asynchronous ConvertWorker with the given list of (src, dest) tuples."""
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setMaximum(len(tasks))
+        self.progress_bar.setValue(0)
+        
+        self.worker = ConvertWorker(tasks, self)
+        self.worker.progress_signal.connect(self.update_progress)
+        self.worker.finished_signal.connect(self.conversion_complete)
+        self.worker.start()
+
+    def generate_rats(self):
+        selected_data = self.get_selected_parm_data()
+        if not selected_data:
+            QtWidgets.QMessageBox.warning(self, "No Selection", "Please highlight parameters or network folders to generate RAT textures.")
+            return
+
+        tasks = []
+        seen_pairs = set()
+        overwrite_prompt_needed = False
+
+        for d in selected_data:
+            src_path = d.get("orig_eval_path") or d["eval_path"]
+            rat_path = d.get("rat_eval_path") or RatManagerCore.get_rat_path(src_path)
+            if not src_path or src_path.lower().endswith(".rat"):
+                continue
+            pair = (src_path, rat_path)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            if os.path.exists(rat_path):
+                overwrite_prompt_needed = True
+            tasks.append(pair)
+
+        if not tasks:
+            return
+
+        if overwrite_prompt_needed:
+            reply = QtWidgets.QMessageBox.question(
+                self, 
+                "Confirm Overwrite", 
+                "One or more .rat destinations already exist on disk. Overwrite files?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+            )
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
+
+        self._run_conversion_tasks(tasks)
+
+    def regenerate_outdated_rats(self):
+        """Finds all Outdated RAT textures in the scene and reconverts them."""
+        exclude_render = self.exclude_render_cb.isChecked()
+        tasks = []
+        seen_pairs = set()
+
+        for d in self.all_items_data:
+            if exclude_render and d.get("is_render_node"):
+                continue
+            if d.get("status") != "Outdated":
+                continue
+
+            src_path = d.get("orig_eval_path") or d["eval_path"]
+            rat_path = d.get("rat_eval_path") or RatManagerCore.get_rat_path(src_path)
+            if not src_path or src_path.lower().endswith(".rat"):
+                continue
+
+            pair = (src_path, rat_path)
+            if pair not in seen_pairs:
+                seen_pairs.add(pair)
+                tasks.append(pair)
+
+        if not tasks:
+            QtWidgets.QMessageBox.information(self, "Up to Date", "No outdated .rat textures were found.")
+            return
+
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Regenerate Outdated RATs",
+            f"Found {len(tasks)} outdated .rat file(s). Overwrite and regenerate them now?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+
+        self._run_conversion_tasks(tasks)
+
+    def update_progress(self, msg, count):
+        self.progress_bar.setValue(count)
+        self.statusBar().showMessage(msg)
+
+    def conversion_complete(self):
+        self.progress_bar.setVisible(False)
+        self.statusBar().showMessage("Conversion process completed successfully.", 5000)
+        self.refresh_data()
+
+    def delete_rats(self):
+        selected_data = self.get_selected_parm_data()
+        rat_paths_to_delete = list({
+            d["rat_eval_path"] for d in selected_data
+            if d.get("rat_eval_path") and os.path.exists(d["rat_eval_path"])
+        })
+
+        if not rat_paths_to_delete:
+            QtWidgets.QMessageBox.information(self, "No Files Found", "No generated .rat files were found on disk matching selection.")
+            return
+
+        reply = QtWidgets.QMessageBox.question(
+            self, 
+            "Confirm Delete", 
+            f"Are you sure you want to permanently delete {len(rat_paths_to_delete)} .rat files from disk?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+
+        for p in rat_paths_to_delete:
+            try:
+                os.remove(p)
+            except Exception as e:
+                print(f"Error clearing {p}: {e}")
+
+        self.refresh_data()
+
+def onCreateInterface():
+    """Houdini's required entry point for instantiating the Python Panel interface."""
+    return RatManagerWindow()
+# ==============================================================================
+# END OF BLOCK 5: ACTIONS, CONTEXT MENUS, AND PANEL INTERFACE INTEGRATION
+# ==============================================================================
